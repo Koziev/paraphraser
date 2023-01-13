@@ -6,6 +6,7 @@
 В качестве дистракторов используем негативные примеры перефразировок из этого же датасета плюс рандомные выборки.
 
 04.01.2023 Заранее подготовленный датасет загружаем из paraphrases.json (см. публичную версию https://huggingface.co/datasets/inkoziev/paraphrases)
+13.01.2023 Для оценки близости текстов теперь используем LaBSE
 """
 
 import collections
@@ -30,9 +31,10 @@ from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader, TensorDataset
 import transformers
 from transformers import AutoTokenizer
+import sentence_transformers
 
 
-num_distractors = 1
+num_distractors = 2
 epochs = 1
 
 
@@ -138,6 +140,7 @@ def load_samples(dataset_path, tokenizer):
                 datasets[dataset_name]['lm_labels'].append(lm_labels)
                 datasets[dataset_name]['token_type_ids'].append(token_type_ids)
                 datasets[dataset_name]['mc_token_ids'].append(mc_token_ids)
+                datasets[dataset_name]['attention_mask'].append([1]*len(input_ids))
 
             datasets[dataset_name]['mc_labels'].append(num_candidates-1)  # у нас всегда последний вариант продолжения - корректный
             datasets[dataset_name]["n_candidates"] = num_candidates
@@ -147,9 +150,10 @@ def load_samples(dataset_path, tokenizer):
         for input_name in ['input_ids', 'token_type_ids']:
             datasets[dataset_name][input_name] = [x + [tokenizer.pad_token_id] * (max_l - len(x)) for x in datasets[dataset_name][input_name]]
         datasets[dataset_name]['lm_labels'] = [x + [-100] * (max_l - len(x)) for x in datasets[dataset_name]['lm_labels']]
+        datasets[dataset_name]['attention_mask'] = [x + [0] * (max_l - len(x)) for x in datasets[dataset_name]['attention_mask']]
 
     # финальное преобразование размерности и конвертация в тензор
-    MODEL_INPUTS = ["input_ids", "mc_token_ids", "lm_labels", "mc_labels", "token_type_ids"]
+    MODEL_INPUTS = ["input_ids", "mc_token_ids", "lm_labels", "mc_labels", "token_type_ids", "attention_mask"]
     tensor_datasets = {"train": [], "valid": []}
     for dataset_name, dataset in datasets.items():
         for input_name in MODEL_INPUTS:
@@ -163,14 +167,15 @@ def load_samples(dataset_path, tokenizer):
 
 def train(model, device, train_generator, test_generator, optimizer, eval_steps):
     total_loss = 0
-    for istep, (input_ids, mc_token_ids, lm_labels, mc_labels, token_type_ids) in tqdm.tqdm(enumerate(train_generator, start=1), desc='Training', total=len(train_generator)):
+    for istep, (input_ids, mc_token_ids, lm_labels, mc_labels, token_type_ids, attention_mask) in tqdm.tqdm(enumerate(train_generator, start=1), desc='Training', total=len(train_generator)):
         model.train()
         outputs = model(input_ids=input_ids.to(device),
                         labels=lm_labels.to(device),
                         #token_type_ids=token_type_ids.to(device),
                         mc_token_ids=mc_token_ids.to(device),
                         mc_labels=mc_labels.to(device),
-                        attention_mask=None)
+                        attention_mask=attention_mask.to(device),
+                        )
         loss = outputs.loss + outputs.mc_loss
         total_loss += loss.item()
         loss.backward()
@@ -178,7 +183,7 @@ def train(model, device, train_generator, test_generator, optimizer, eval_steps)
         optimizer.zero_grad()
 
         if 0 == (istep % eval_steps):
-            visualize(tokenizer, model, device, ['В лесу родилась ёлочка', 'Пока испить нектар любви',
+            visualize(tokenizer, model, device, ['В лесу родилась ёлочка', 'Пора испить нектар любви',
                                                  'Мишка по лесу идет', 'Туман над озером клубится',
                                                  'Я иду, шагаю по Москве', 'Как хороши, как свежи были розы',
                                                  'У бурных чувств неистовый конец',
@@ -197,13 +202,13 @@ def train(model, device, train_generator, test_generator, optimizer, eval_steps)
 def test(model, device, batch_generator):
     model.eval()
     total_loss = 0
-    for input_ids, mc_token_ids, lm_labels, mc_labels, token_type_ids in batch_generator:
+    for input_ids, mc_token_ids, lm_labels, mc_labels, token_type_ids, attention_mask in batch_generator:
         outputs = model(input_ids=input_ids.to(device),
                         labels=lm_labels.to(device),
                         #token_type_ids=token_type_ids.to(device),
                         mc_token_ids=mc_token_ids.to(device),
                         mc_labels=mc_labels.to(device),
-                        attention_mask=None)
+                        attention_mask=attention_mask.to(device))
         loss = outputs.loss + outputs.mc_loss
         total_loss += loss.item()
 
@@ -244,15 +249,6 @@ def visualize(tokenizer, model, device, viz_prompts):
         generated_text = generate_paraphrase(tokenizer, model, device, prompt)
         print('{} ==> {}'.format(prompt, generated_text))
     print('-'*80)
-
-
-def mean_pooling(model_output, attention_mask):
-    """ Mean Pooling - Take attention mask into account for correct averaging """
-    token_embeddings = model_output[0]  #First element of model_output contains all token embeddings
-    input_mask_expanded = attention_mask.unsqueeze(-1).expand(token_embeddings.size()).float()
-    sum_embeddings = torch.sum(token_embeddings * input_mask_expanded, 1)
-    sum_mask = torch.clamp(input_mask_expanded.sum(1), min=1e-9)
-    return sum_embeddings / sum_mask
 
 
 if __name__ == '__main__':
@@ -326,25 +322,19 @@ if __name__ == '__main__':
     # TODO: сделать пакетную генерацию в gpt, получение эмбеддинов в sbert батчами
     if len(eval_samples) > 0:
         model.eval()
-        embedder_model_name = 'sberbank-ai/sbert_large_mt_nlu_ru'
-        print('Calculate final metrics using "{}"...'.format(embedder_model_name))
 
-        print('Loading BERT model "{}"...'.format(embedder_model_name))
-        bert_tokenizer = AutoTokenizer.from_pretrained(embedder_model_name)
-        bert_model = transformers.AutoModel.from_pretrained(embedder_model_name)
-        bert_model.eval()
-        bert_model.to(device)
+        embedder_model_name = 'sentence-transformers/LaBSE'
+        print('Loading embedder model "{}"...'.format(embedder_model_name))
+        embedder = sentence_transformers.SentenceTransformer(embedder_model_name, device="cuda" if use_cuda else "cpu")
+
+        print('Calculate final metrics using "{}"...'.format(embedder_model_name))
 
         sims = []
         eval_texts = list(set(itertools.chain(*[sample.paraphrases for sample in eval_samples])))
         for eval_text in tqdm.tqdm(eval_texts, desc='Evaluation'):
             paraphrase = generate_paraphrase(tokenizer, model, device, eval_text)
-            encoded_input = bert_tokenizer([eval_text, paraphrase], padding=True, truncation=True, max_length=512, return_tensors='pt')
-            encoded_input = encoded_input.to(device)
-            with torch.no_grad():
-                model_output = bert_model(**encoded_input)
-            embeddings = mean_pooling(model_output, encoded_input['attention_mask'])
-            vx = embeddings.detach().cpu().tolist()
+
+            vx = embedder.encode([eval_text, paraphrase], device="cuda" if use_cuda else "cpu").tolist()
             sim = 1.0 - scipy.spatial.distance.cosine(u=vx[0], v=vx[1])
 
             # дисконтируем на символьную похожесть
