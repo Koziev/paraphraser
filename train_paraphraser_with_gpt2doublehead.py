@@ -7,6 +7,8 @@
 
 04.01.2023 Заранее подготовленный датасет загружаем из paraphrases.json (см. публичную версию https://huggingface.co/datasets/inkoziev/paraphrases)
 13.01.2023 Для оценки близости текстов теперь используем LaBSE
+05.02.2023 Метрики семантической и символьной похожести при финальной оценке разделены.
+05.02.2023 Добавлен расчет BaryScore (см. https://arxiv.org/abs/2108.12463)
 """
 
 import collections
@@ -16,6 +18,7 @@ import io
 import random
 import itertools
 import re
+import argparse
 
 import numpy as np
 import scipy
@@ -34,7 +37,7 @@ from transformers import AutoTokenizer
 import sentence_transformers
 
 
-num_distractors = 2
+num_distractors = 4
 epochs = 1
 
 
@@ -60,6 +63,7 @@ class Samples(object):
         self.distractors = set(distractors)
 
 
+# TODO: переделать на динамический подбор негативных сэмплов в каждом батче?
 def load_samples(dataset_path, tokenizer):
     with open(dataset_path, 'r') as f:
         data = json.load(f)
@@ -69,6 +73,12 @@ def load_samples(dataset_path, tokenizer):
     # Сразу отделим holdout для финальной оценки, и train/test для тренировки с early stopping.
     train_samples, test2_samples = sklearn.model_selection.train_test_split(samples, test_size=0.10, random_state=123456789)
     test_samples, eval_samples = sklearn.model_selection.train_test_split(test2_samples, test_size=1000, random_state=123456789)
+
+    # НАЧАЛО ОТЛАДКИ
+    #train_samples = train_samples[:1000]
+    #test_samples = test_samples[:1000]
+    #eval_samples = eval_samples[:100]
+    # КОНЕЦ ОТЛАДКИ
 
     # В тех сэмплах, где не заданы негативные примеры, нам надо будет как-то подобрать их автоматически.
     # Сделаем это, рандомно выбирая фразы из пула всех фраз датасета.
@@ -252,6 +262,12 @@ def visualize(tokenizer, model, device, viz_prompts):
 
 
 if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description='Paraphrase model finetuning')
+    parser.add_argument('--model', type=str, default='sberbank-ai/rugpt3small_based_on_gpt2', help='Name or path of pretrained LM to be finetuned')
+    parser.add_argument('--batch_size', type=int, default=16, help='Batch size')
+
+    args = parser.parse_args()
+
     proj_dir = os.path.expanduser('~/polygon/chatbot')
 
     use_cuda = torch.cuda.is_available()
@@ -260,12 +276,12 @@ if __name__ == '__main__':
 
     output_dir = os.path.join(proj_dir, 'tmp', 'rugpt_paraphraser2')
 
-    is_distributed = False
-    train_batch_size = 4
+    is_distributed = False  # TODO: сделать поддержку multi-gpu
+    train_batch_size = args.batch_size
     valid_batch_size = 1
-    eval_steps = 1000
+    eval_steps = 2000
 
-    pretrained_model_name = 'sberbank-ai/rugpt3large_based_on_gpt2'
+    pretrained_model_name = args.model
 
     tokenizer = AutoTokenizer.from_pretrained(pretrained_model_name)
 
@@ -273,13 +289,13 @@ if __name__ == '__main__':
     model.to(device)
 
     tokenizer.add_special_tokens({'bos_token': '<s>', 'eos_token': '</s>', 'pad_token': '<pad>'})
-    num_added_tokens = tokenizer.add_tokens(['<sep>'])
+    num_added_tokens = tokenizer.add_tokens(['<sep>'])  # добавляем спецтокен для отделения исходного текста и перефразировки
     if num_added_tokens > 0:
         model.resize_token_embeddings(new_num_tokens=len(tokenizer))
 
     tokenizer.save_pretrained(output_dir)
 
-    # Загружаем штатный датасет перефразировок для файнтюна силлабо-тонической GPT.
+    # Загружаем штатный датасет перефразировок - см. https://huggingface.co/datasets/inkoziev/paraphrases
     print('Loading dataset...')
     tensor_datasets, eval_samples = load_samples(os.path.join(proj_dir, 'tmp', 'paraphrases.json'), tokenizer)
 
@@ -296,7 +312,7 @@ if __name__ == '__main__':
     #optimizer = optim.Adamax(model.parameters(), lr=1e-5)
     #optimizer = optim.RMSprop(model.parameters())
     #scheduler = StepLR(optimizer, step_size=1, gamma=args.gamma)
-    optimizer = optim.AdamW(model.parameters(), lr=1e-5)
+    optimizer = optim.AdamW(model.parameters(), lr=2e-6)
     best_loss = np.inf
     for epoch in range(1, epochs+1):
         print('\n=== EPOCH {}/{} ==='.format(epoch, epochs))
@@ -317,28 +333,61 @@ if __name__ == '__main__':
             print('Training interrupted.')
             break
 
+    # ---------------------------------------------------
     # Финальная оценка модели.
-    # TODO: подцепить оценку метриками BaryScore, InfoLM отсюда https://github.com/PierreColombo/nlg_eval_via_simi_measures
-    # TODO: сделать пакетную генерацию в gpt, получение эмбеддинов в sbert батчами
+    # ---------------------------------------------------
     if len(eval_samples) > 0:
+        print('*** EVALUATION ***')
+
         model.eval()
 
-        embedder_model_name = 'sentence-transformers/LaBSE'
-        print('Loading embedder model "{}"...'.format(embedder_model_name))
-        embedder = sentence_transformers.SentenceTransformer(embedder_model_name, device="cuda" if use_cuda else "cpu")
-
-        print('Calculate final metrics using "{}"...'.format(embedder_model_name))
-
-        sims = []
+        # Нагенерируем перефразировки для всех тестовых сэмплов.
+        # TODO: сделать пакетную генерацию в gpt, получение эмбеддинов в sbert батчами
         eval_texts = list(set(itertools.chain(*[sample.paraphrases for sample in eval_samples])))
-        for eval_text in tqdm.tqdm(eval_texts, desc='Evaluation'):
+        eval_paraphrases = []
+        for eval_text in tqdm.tqdm(eval_texts, desc='Paraphrasing'):
             paraphrase = generate_paraphrase(tokenizer, model, device, eval_text)
+            eval_paraphrases.append(paraphrase)
 
-            vx = embedder.encode([eval_text, paraphrase], device="cuda" if use_cuda else "cpu").tolist()
+        # Модель перефразировки нам больше не нужна.
+        del model
+
+
+        print('Running BaryScore metric calculations...')
+        from nlg_eval_via_simi_measures.bary_score import BaryScoreMetric
+        bary_scorer = BaryScoreMetric(model_name='sberbank-ai/ruBert-base', last_layers=5, use_idfs=True, sinkhorn_ref=0.01)
+        hyps = eval_texts
+        refs = eval_paraphrases
+        wasserstein_dist = []
+        with tqdm.tqdm(total=len(hyps)) as pbar:
+            while len(hyps) > 0:
+                batch_refs = refs[:train_batch_size]
+                batch_hyps = hyps[:train_batch_size]
+                bary_scorer.prepare_idfs(refs=batch_refs, hyps=batch_hyps)
+                res = bary_scorer.evaluate_batch(batch_hyps=batch_hyps, batch_refs=batch_refs, show_tqdm=False)
+                wasserstein_dist.extend(res['baryscore_W'])
+                hyps = hyps[train_batch_size:]
+                refs = refs[train_batch_size:]
+                pbar.update(len(batch_hyps))
+
+        print('\nMean baryscore_W={}\n'.format(np.mean(wasserstein_dist)))
+        del bary_scorer
+
+        # Теперь оцениваем смысловую и буквальную близость текстов и их перефразировок.
+        embedder_model_name = 'sentence-transformers/LaBSE'
+        print('Calculate similarity metrics using "{}"...'.format(embedder_model_name))
+        embedder = sentence_transformers.SentenceTransformer(embedder_model_name, device="cuda" if use_cuda else "cpu")
+        sem_sims = []
+        char_sims = []
+        eval_texts = list(set(itertools.chain(*[sample.paraphrases for sample in eval_samples])))
+        for eval_text, paraphrase in tqdm.tqdm(zip(eval_texts, eval_paraphrases), desc='Embedding similarity'):
+            # Косинусная близость эмбеддингов
+            vx = embedder.encode([eval_text, paraphrase], show_progress_bar=False, device="cuda" if use_cuda else "cpu").tolist()
             sim = 1.0 - scipy.spatial.distance.cosine(u=vx[0], v=vx[1])
+            sem_sims.append(sim)
 
-            # дисконтируем на символьную похожесть
+            # символьная похожесть
             j_sim = jaccard(eval_text, paraphrase, 3)
-            sims.append(sim * (1.0 - j_sim))
+            char_sims.append(sim * (1.0 - j_sim))
 
-        print('Mean quality: {}'.format(np.mean(sims)))
+        print('\nMean semantic similarity = {}\nMean character similarity = {}'.format(np.mean(sem_sims), np.mean(char_sims)))
