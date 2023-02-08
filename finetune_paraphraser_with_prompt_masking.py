@@ -7,6 +7,8 @@ import json
 import io
 import random
 import itertools
+import collections
+import argparse
 
 import numpy as np
 import tqdm
@@ -21,6 +23,7 @@ from torch.utils.data import Dataset, DataLoader
 from transformers import AutoModelForCausalLM
 import transformers
 from transformers import AutoTokenizer
+import sentence_transformers
 
 
 
@@ -34,19 +37,25 @@ def jaccard(s1, s2, shingle_len):
     return float(len(shingles1 & shingles2)) / float(1e-8 + len(shingles1 | shingles2))
 
 
+
 def load_samples(dataset_path, tokenizer):
-    samples = []
     with open(dataset_path, 'r') as f:
         data = json.load(f)
-        for sample in data:
-            for src_text, positive in itertools.combine(sample['paraphrases']):
-                input_tokens = tokenizer.encode(src_text)
-                output_tokens = tokenizer.encode(positive)
-                samples.append((input_tokens, output_tokens, src_text, positive))
-                assert not any((t is None) for t in input_tokens)
-                assert not any((t is None) for t in output_tokens)
 
-    return samples
+    train_data, eval_data = sklearn.model_selection.train_test_split(data, test_size=0.05, random_state=123456789)
+
+    eval_texts = list(itertools.chain(*[sample['paraphrases'] for sample in eval_data]))
+
+    samples = []
+    for sample in train_data:
+        for src_text, positive in itertools.combinations(sample['paraphrases'], r=2):
+            input_tokens = tokenizer.encode(src_text)
+            output_tokens = tokenizer.encode(positive)
+            samples.append((input_tokens, output_tokens, src_text, positive))
+            assert not any((t is None) for t in input_tokens)
+            assert not any((t is None) for t in output_tokens)
+
+    return samples, eval_texts
 
 
 class FinetuneDataset(Dataset):
@@ -171,11 +180,18 @@ def visualize(tokenizer, model, device, viz_prompts):
 if __name__ == '__main__':
     proj_dir = os.path.expanduser('~/polygon/chatbot')
 
+    parser = argparse.ArgumentParser(description='Paraphrase model finetuning')
+    parser.add_argument('--model', type=str, default='sberbank-ai/rugpt3small_based_on_gpt2', help='Name or path of pretrained LM to be finetuned')
+    parser.add_argument('--batch_size', type=int, default=16, help='Batch size')
+    parser.add_argument('--lr', type=float, default=2e-6, help='Learning rate')
+
+    args = parser.parse_args()
+
     use_cuda = torch.cuda.is_available()
     device = torch.device("cuda" if use_cuda else "cpu")
     print('device={}'.format(device))
 
-    pretrained_model_name = 'sberbank-ai/rugpt3large_based_on_gpt2'
+    pretrained_model_name = args.model
 
     output_dir = os.path.join(proj_dir, 'tmp', 'rugpt_paraphraser2')
 
@@ -184,10 +200,8 @@ if __name__ == '__main__':
     num_added_tokens = tokenizer.add_tokens(['<sep>'])
 
     print('Loading dataset...')
-    samples = load_samples(os.path.join(proj_dir, 'tmp', 'paraphrases.json'), tokenizer)
-    train_samples, test2_samples = sklearn.model_selection.train_test_split(samples, test_size=0.10, random_state=123456789)
-    test_samples, eval_samples = sklearn.model_selection.train_test_split(test2_samples, test_size=0.50, random_state=123456789)
-    # eval_samples будут нужны для финальной оценки качества. Модель не будет видеть их в ходе тренировки и тестов.
+    samples, eval_texts = load_samples(os.path.join(proj_dir, 'tmp', 'paraphrases.json'), tokenizer)
+    train_samples, test_samples = sklearn.model_selection.train_test_split(samples, test_size=0.05, random_state=123456789)
 
     print('Train samples: {}, test samples: {}'.format(len(train_samples), len(test_samples)))
 
@@ -205,11 +219,12 @@ if __name__ == '__main__':
     #optimizer = optim.Adamax(model.parameters(), lr=1e-5)
     #optimizer = optim.RMSprop(model.parameters())
     #scheduler = StepLR(optimizer, step_size=1, gamma=args.gamma)
-    optimizer = optim.AdamW(model.parameters(), lr=1e-5)
+    optimizer = optim.AdamW(model.parameters(), lr=args.lr)
 
-    batch_size = 10
-    train_generator = torch.utils.data.DataLoader(train_dataset, batch_size=batch_size)
-    test_generator = torch.utils.data.DataLoader(test_dataset, batch_size=1)
+    train_batch_size = args.batch_size
+    valid_batch_size = args.batch_size
+    train_generator = torch.utils.data.DataLoader(train_dataset, batch_size=train_batch_size)
+    test_generator = torch.utils.data.DataLoader(test_dataset, batch_size=valid_batch_size)
 
     epochs = 1
 
@@ -232,29 +247,60 @@ if __name__ == '__main__':
             print('Training interrupted.')
             break
 
-    # Финальная оценка
-    if len(eval_samples) > 0:
+    # ---------------------------------------------------
+    # Финальная оценка модели.
+    # ---------------------------------------------------
+    if len(eval_texts) > 0:
+        print('*** EVALUATION ***')
+
         model.eval()
-        embedder_model_name = 'sberbank-ai/sbert_large_mt_nlu_ru'
-        print('Calculate final metrics using "{}"...'.format(embedder_model_name))
 
-        print('Loading BERT model "{}"...'.format(embedder_model_name))
-        bert_tokenizer = AutoTokenizer.from_pretrained(embedder_model_name)
-        bert_model = transformers.AutoModel.from_pretrained(embedder_model_name)
-        bert_model.eval()
-        bert_model.to(device)
+        # Нагенерируем перефразировки для всех тестовых сэмплов.
+        # TODO: сделать пакетную генерацию в gpt, получение эмбеддинов в sbert батчами
+        eval_paraphrases = []
+        for eval_text in tqdm.tqdm(eval_texts, desc='Paraphrasing'):
+            paraphrase = generate_paraphrase(tokenizer, model, device, eval_text)
+            eval_paraphrases.append(paraphrase)
 
-        sims = []
-        for _, _, src_text, _ in tqdm.tqdm(eval_samples, desc='Evaluation'):
-            paraphrase = generate_paraphrase(tokenizer, model, device, src_text)
-            encoded_input = bert_tokenizer([src_text, paraphrase], padding=True, truncation=True, max_length=512, return_tensors='pt')
-            encoded_input = encoded_input.to(device)
-            with torch.no_grad():
-                model_output = bert_model(**encoded_input)
-            embeddings = mean_pooling(model_output, encoded_input['attention_mask'])
-            vx = embeddings.detach().cpu().tolist()
+        # Модель перефразировки нам больше не нужна.
+        del model
+
+
+        print('Running BaryScore metric calculations...')
+        from nlg_eval_via_simi_measures.bary_score import BaryScoreMetric
+        bary_scorer = BaryScoreMetric(model_name='sberbank-ai/ruBert-base', last_layers=5, use_idfs=True, sinkhorn_ref=0.01)
+        hyps = eval_texts
+        refs = eval_paraphrases
+        wasserstein_dist = []
+        with tqdm.tqdm(total=len(hyps)) as pbar:
+            while len(hyps) > 0:
+                batch_refs = refs[:train_batch_size]
+                batch_hyps = hyps[:train_batch_size]
+                bary_scorer.prepare_idfs(refs=batch_refs, hyps=batch_hyps)
+                res = bary_scorer.evaluate_batch(batch_hyps=batch_hyps, batch_refs=batch_refs, show_tqdm=False)
+                wasserstein_dist.extend(res['baryscore_W'])
+                hyps = hyps[train_batch_size:]
+                refs = refs[train_batch_size:]
+                pbar.update(len(batch_hyps))
+        del bary_scorer
+
+        # Теперь оцениваем смысловую и буквальную близость текстов и их перефразировок.
+        embedder_model_name = 'sentence-transformers/LaBSE'
+        print('Calculate similarity metrics using "{}"...'.format(embedder_model_name))
+        embedder = sentence_transformers.SentenceTransformer(embedder_model_name, device="cuda" if use_cuda else "cpu")
+        sem_sims = []
+        char_sims = []
+        for eval_text, paraphrase in tqdm.tqdm(zip(eval_texts, eval_paraphrases), desc='Embedding similarity', total=len(eval_texts)):
+            # Косинусная близость эмбеддингов
+            vx = embedder.encode([eval_text, paraphrase], show_progress_bar=False, device="cuda" if use_cuda else "cpu").tolist()
             sim = 1.0 - scipy.spatial.distance.cosine(u=vx[0], v=vx[1])
-            j_sim = jaccard(src_text, paraphrase, 3)
-            sims.append(sim * (1.0 - j_sim))
+            sem_sims.append(sim)
 
-        print('Mean quality: {}'.format(np.mean(sims)))
+            # символьная похожесть
+            j_sim = jaccard(eval_text, paraphrase, 3)
+            char_sims.append(sim * (1.0 - j_sim))
+
+        print('\n' + '='*80 + '\n')
+        print('Mean baryscore_W          = {}'.format(np.mean(wasserstein_dist)))
+        print('Mean semantic similarity  = {}'.format(np.mean(sem_sims)))
+        print('Mean character similarity = {}'.format(np.mean(char_sims)))

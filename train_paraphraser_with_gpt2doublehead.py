@@ -265,6 +265,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Paraphrase model finetuning')
     parser.add_argument('--model', type=str, default='sberbank-ai/rugpt3small_based_on_gpt2', help='Name or path of pretrained LM to be finetuned')
     parser.add_argument('--batch_size', type=int, default=16, help='Batch size')
+    parser.add_argument('--lr', type=float, default=2e-6, help='Learning rate')
 
     args = parser.parse_args()
 
@@ -278,7 +279,7 @@ if __name__ == '__main__':
 
     is_distributed = False  # TODO: сделать поддержку multi-gpu
     train_batch_size = args.batch_size
-    valid_batch_size = 1
+    valid_batch_size = args.batch_size
     eval_steps = 2000
 
     pretrained_model_name = args.model
@@ -312,7 +313,8 @@ if __name__ == '__main__':
     #optimizer = optim.Adamax(model.parameters(), lr=1e-5)
     #optimizer = optim.RMSprop(model.parameters())
     #scheduler = StepLR(optimizer, step_size=1, gamma=args.gamma)
-    optimizer = optim.AdamW(model.parameters(), lr=2e-6)
+    optimizer = optim.AdamW(model.parameters(), lr=args.lr)
+    print(f'Start training with learning_rate={args.lr}')
     best_loss = np.inf
     for epoch in range(1, epochs+1):
         print('\n=== EPOCH {}/{} ==='.format(epoch, epochs))
@@ -369,8 +371,6 @@ if __name__ == '__main__':
                 hyps = hyps[train_batch_size:]
                 refs = refs[train_batch_size:]
                 pbar.update(len(batch_hyps))
-
-        print('\nMean baryscore_W={}\n'.format(np.mean(wasserstein_dist)))
         del bary_scorer
 
         # Теперь оцениваем смысловую и буквальную близость текстов и их перефразировок.
@@ -380,7 +380,7 @@ if __name__ == '__main__':
         sem_sims = []
         char_sims = []
         eval_texts = list(set(itertools.chain(*[sample.paraphrases for sample in eval_samples])))
-        for eval_text, paraphrase in tqdm.tqdm(zip(eval_texts, eval_paraphrases), desc='Embedding similarity'):
+        for eval_text, paraphrase in tqdm.tqdm(zip(eval_texts, eval_paraphrases), desc='Embedding similarity', total=len(eval_texts)):
             # Косинусная близость эмбеддингов
             vx = embedder.encode([eval_text, paraphrase], show_progress_bar=False, device="cuda" if use_cuda else "cpu").tolist()
             sim = 1.0 - scipy.spatial.distance.cosine(u=vx[0], v=vx[1])
@@ -390,4 +390,5 @@ if __name__ == '__main__':
             j_sim = jaccard(eval_text, paraphrase, 3)
             char_sims.append(sim * (1.0 - j_sim))
 
+        print('\nMean baryscore_W={}\n'.format(np.mean(wasserstein_dist)))
         print('\nMean semantic similarity = {}\nMean character similarity = {}'.format(np.mean(sem_sims), np.mean(char_sims)))
