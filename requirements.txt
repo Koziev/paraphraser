@@ -5,3 +5,4 @@ transformers
 tqdm
 geomloss
 POT
+git+https://github.com/lvwerra/trl
